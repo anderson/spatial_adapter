@@ -1,7 +1,7 @@
 require 'rubygems'
 require 'rspec/core/rake_task'
 
-[:mysql, :mysql2, :postgresql].each do |adapter|
+[:mysql, :mysql2, :postgresql, :oracle_enhanced].each do |adapter|
   desc "Run specs for #{adapter} adapter"
   RSpec::Core::RakeTask.new("spec:#{adapter.to_s}") do |spec|
     spec.pattern = "spec/#{adapter}/*_spec.rb"
@@ -18,7 +18,7 @@ begin
     gem.authors = ["Pete Deffendol", "Guilhem Vellut"]
     gem.email = "pete@fragility.us"
     gem.homepage = "http://github.com/fragility/spatial_adapter"
-    
+
     gem.files = FileList[
       "rails/*.rb",
       "lib/**/*.rb",
@@ -30,7 +30,7 @@ begin
       "spec/**/*.rb",
       "spec/README.txt"
     ]
-  
+
     gem.add_dependency 'activerecord', '>= 2.2.2'
     gem.add_dependency 'GeoRuby', '>= 1.3.0'
   end
