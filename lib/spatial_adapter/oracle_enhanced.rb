@@ -1,357 +1,562 @@
-# Oracle can be very moody when it comes to Spatial tables. There are some common
-# problems you may encounter when creating indexes as follows.
-#
-# MULTIPLE ENTRIES IN SDO_INDEX_METADATA
-#
-#  If you receive the following error when creating a spatial index:
-#
-#   ERROR at line 1:
-#   ORA-29855: error occurred in the execution of ODCIINDEXCREATE routine
-#   ORA-13249: internal error in Spatial index: [mdidxrbd]
-#   ORA-13249: Multiple entries in sdo_index_metadata table
-#   ORA-06512: at "MDSYS.SDO_INDEX_METHOD_10I", line 10
-#
-#  Then you should execute the following queries as a SYS user:
-#
-#   select * from all_sdo_geom_metadata;           -- Should have entries for each of your spatial columns
-#   select * from all_sdo_index_metadata;          -- Should have no entries referring to your user and table
-#   select * from mdsys.sdo_index_metadata_table;  -- Should have no entries referring to your user, table, and index
-#
-#  If you have orphaned entries of index type: MDIDX_INIT
-#  Then index creation failed for an internal reason, most likely a lack of available space.
-#  Try granting your user unlimited space in USER and SYSTEM spaces.
-#
-#  Otherwise, try running this query as a SYS user:
-#    delete from mdsys.sdo_index_metadata_table;
-#
-#  Then try deleteing all tables that start with MDRT_
-#
-# DATA CARTRIDGE ERROR / SEQUENCE DOESN'T EXIST
-#
-#  OCIError: ORA-29856: error occurred in the execution of ODCIINDEXDROP routine
-#  ORA-13249: Error in Spatial index: cannot drop sequence ARES_TEST.MDRS_68EB0$
-#  ORA-13249: Stmt-Execute Failure: DROP SEQUENCE ARES_TEST.MDRS_68EB0$
-#  ORA-29400: data cartridge error
-#  ORA-02289: sequence does not exist
-#  ORA-06512: at "MDSYS.SDO_INDEX_METHOD_10I", line 27: DROP INDEX index_aow_geoms_on_geom
-#
-# If you solve other problems related to creating Oracle Spatial tables and indexes, please
-# document them here.
-#
-
-
-
-require 'active_record/connection_adapters/abstract_adapter'
-require 'active_record/connection_adapters/oracle_enhanced_connection'
+require 'spatial_adapter'
 require 'active_record/connection_adapters/oracle_enhanced_adapter'
-require 'spatial_adapter/schema_definitions'
+
+include GeoRuby::SimpleFeatures
+include SpatialAdapter
+
+ActiveRecord::ConnectionAdapters::OracleEnhancedIndexDefinition.class_eval do
+  def spatial
+    type == "MDSYS.SPATIAL_INDEX"
+  end
+end
+
+ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter.class_eval do
+
+  include SpatialAdapter
+
+  SPATIAL_TOLERANCE = 0.5
+
+  def default_srid
+    4326
+  end
+
+  alias :original_native_database_types :native_database_types
+  def native_database_types
+    types = original_native_database_types.merge!(geometry_data_types)
+
+    # Change mapping of :float from NUMBER to FLOAT, as oracle
+    # recognizes the ansi keyword and it helps keep the schema
+    # stable, even though it ends up mapping to the same underlying
+    # native type.
+    types[:float] = {:name => "FLOAT", :limit => 126 }
+
+    types
+  end
+
+  #Redefines the quote method to add behaviour for when a Geometry is encountered ; used when binding variables in find_by methods
+  def quote(value, column = nil)
+    if value.kind_of?(GeoRuby::SimpleFeatures::Geometry)
+      quote_generic_geom( value )
+    elsif value && column && [:text, :binary].include?(column.type)
+      %Q{empty_#{ column.sql_type.downcase rescue 'blob' }()}
+    else
+      super
+    end
+  end
+
+  def quote_point_geom( value )
+    if !value.with_z && !value.with_m
+      "SDO_GEOMETRY( 2001, #{value.srid}, MDSYS.SDO_POINT_TYPE( #{value.x}, #{value.y}, NULL ), NULL, NULL )"
+    elsif value.with_z && value.with_m
+      raise ArgumentError, "4d points not currently supported in the oracle_enhanced spatial adapter."
+      #"SDO_GEOMETRY( 2001, #{value.srid}, MDSYS.SDO_POINT_TYPE( #{value.x}, #{value.y}, #{value.z}, #{value.m} ), NULL, NULL )"
+    elsif value.with_z
+      "SDO_GEOMETRY( 3001, #{value.srid}, MDSYS.SDO_POINT_TYPE( #{value.x}, #{value.y}, #{value.z} ), NULL, NULL )"
+    elsif value.with_m
+      raise ArgumentError, "3d points (with M coord) not currently supported in the oracle_enhanced spatial adapter."
+      #"SDO_GEOMETRY( 2001, #{value.srid}, MDSYS.SDO_POINT_TYPE( #{value.x}, #{value.y}, #{value.m} ), NULL, NULL )"
+    end
+  end
+
+  # This technique only supports 2d geometries
+  def quote_generic_geom( value )
+    if value.kind_of?( GeoRuby::SimpleFeatures::Point )
+      # Small optimization for the most commonly used type: points.  Oracle's WKT parsing seems slow
+      quote_point_geom( value )
+    else
+      "SDO_GEOMETRY( '#{value.as_wkt}', #{value.srid} )"
+    end
+  end
+
+  def create_table(name, options = {})
+    table_definition = ActiveRecord::ConnectionAdapters::OracleTableDefinition.new(self)
+    table_definition.primary_key(options[:primary_key] || "id") unless options[:id] == false
+
+    yield table_definition if block_given?
+
+    # table_exists? is slow
+    #if options[:force] && table_exists?(name)
+    if options[:force]
+      drop_table(name) rescue nil
+    end
+
+    create_sql = "CREATE#{' TEMPORARY' if options[:temporary]} TABLE "
+    create_sql << "#{name} ("
+    create_sql << table_definition.to_sql
+    create_sql << ") #{options[:options]}"
+    execute create_sql
+    execute "CREATE SEQUENCE #{name}_seq START WITH 10000" unless options[:id] == false
+
+    #added to create the geometric columns identified during the table definition
+    unless table_definition.geom_columns.nil?
+      table_definition.geom_columns.each do |geom_column|
+        geom_column.sql_create_statements(name).each do |stmt|
+          execute stmt
+        end
+      end
+    end
+  end
+
+  # We override this for three reasons:
+  # 1) Drop spatial indexes before dropping the tables, as "drop table cascade constraints"
+  #    seems to leave metadata around in SDO_INDEX_METADATA_TABLE
+  # 2) Avoid dropping sequences that end in '$', as those are for the spatial indexes (which get dropped above)
+  # 3) Need to clear out USER_SDO_GEOM_METADATA after everything else is done.
+  def structure_drop
+    s = []
+    select_values("select sdo_index_name from user_sdo_index_metadata").uniq.each do |idx|
+      s << "DROP INDEX \"#{idx}\""
+    end
+
+    select_values("select sequence_name from user_sequences order by 1").each do |seq|
+      s << "DROP SEQUENCE \"#{seq}\"" unless seq[-1,1] == '$'
+    end
+    select_values("select table_name from all_tables t
+                where owner = sys_context('userenv','session_user') and secondary='N'
+                  and not exists (select mv.mview_name from all_mviews mv where mv.owner = t.owner and mv.mview_name = t.table_name)
+                  and not exists (select mvl.log_table from all_mview_logs mvl where mvl.log_owner = t.owner and mvl.log_table = t.table_name)
+                order by 1").each do |table|
+      s << "DROP TABLE \"#{table}\" CASCADE CONSTRAINTS"
+    end
+    s << "DELETE FROM USER_SDO_GEOM_METADATA"
+    join_with_statement_token(s)
+  end
+
+  alias :original_remove_column :remove_column
+  def remove_column(table_name,column_name)
+    columns(table_name).each do |col|
+      if col.name.to_s == column_name.to_s
+        #check if the column is geometric
+        if col.is_a?(SpatialColumn) && col.spatial?
+          execute "DELETE FROM USER_SDO_GEOM_METADATA WHERE TABLE_NAME = '#{table_name.upcase}' AND COLUMN_NAME = '#{column_name.to_s.upcase}'"
+          execute "ALTER TABLE #{table_name} DROP COLUMN #{column_name}"
+        else
+          original_remove_column(table_name,column_name)
+        end
+      end
+    end
+  end
+
+  alias :original_add_column :add_column
+  def add_column(table_name, column_name, type, options = {})
+    unless geometry_data_types[type].nil?
+      geom_column = ActiveRecord::ConnectionAdapters::OracleColumnDefinition.new(self,column_name, type, nil,nil,options[:null],options[:srid] || -1 , options[:with_z] || false , options[:with_m] || false)
+      geom_column.sql_create_statements(table_name).each do |stmt|
+        execute stmt
+      end
+    else
+      original_add_column(table_name,column_name,type,options)
+    end
+  end
+
+  #Adds a spatial index to a column. Its name will be index_<table_name>_on_<column_name> unless the key :name is present in the options hash, in which case its value is taken as the name of the index.
+  def add_index(table_name,column_name,options = {})
+    # invalidate index cache
+    self.all_schema_indexes = nil
+    index_name = options[:name] || "index_#{table_name}_on_#{column_name}"
+    if options[:spatial]
+      execute "CREATE INDEX #{index_name} ON #{table_name} (#{column_name}) INDEXTYPE IS mdsys.spatial_index"
+    else
+      index_type = options[:unique] ? "UNIQUE" : ""
+      #all together
+      execute "CREATE #{index_type} INDEX #{index_name} ON #{table_name} (#{Array(column_name).join(", ")})"
+    end
+  end
+
+  private
+
+  def column_spatial_info(table_name)
+    rows = select_all <<-end_sql
+    SELECT column_name, diminfo, srid
+    FROM user_sdo_geom_metadata
+    WHERE table_name = '#{table_name}'
+    end_sql
+
+    raw_geom_infos = {}
+    rows.each do |row|
+      column_name = oracle_downcase(row['column_name'])
+      dims = row['diminfo'].to_ary
+      raw_geom_info = raw_geom_infos[column_name] || ActiveRecord::ConnectionAdapters::RawGeomInfo.new
+      raw_geom_info.type = "geometry"
+      raw_geom_info.with_m = dims.any? {|d| d.sdo_dimname == 'M'}
+      raw_geom_info.with_z = dims.any? {|d| d.sdo_dimname == 'Z'}
+      raw_geom_info.srid = row['srid'].to_i
+      #raw_geom_info.diminfo = row['diminfo']
+      raw_geom_infos[column_name] = raw_geom_info
+    end #constr.each
+
+    raw_geom_infos
+  end
+
+end
 
 module ActiveRecord
   module ConnectionAdapters
-
-    class SpatialOracleColumn < OracleEnhancedColumn
-      include SpatialColumn
-      def self.string_to_geometry(string)
-        return string unless string.is_a?(String)
-        GeoRuby::SimpleFeatures::Geometry.from_hex_ewkb(string) rescue nil
-      end
-      def self.create_simplified(name,default,null = true)
-        new(name,default,"geometry",null,nil,nil,nil)
-      end
-    end
-
-    class SpatialOracleEnhancedColumn < SpatialOracleColumn; end
-
-    module SpatialTableDefinition
-      attr_accessor :column_comments, :create_sequence
-
-      def geometry(*args)                                             # This method allows you to
-        options = args.extract_options!                               # create_table :spatial_datas do |t|
-        column_names = args                                           #   t.geometry :geom
-        column_names.each { |name| column(name, :geometry, options) } # end
-      end                                                             #
-
-      def spatial_columns
-        columns.select { |c| @base.geometry_data_types.include?(c.type.to_sym) }
-      end
-
-      def primary_key(*args)
-        self.create_sequence = true
-        super(*args)
-      end
-
-      def column(name, type, options = {})
-        if options[:comment]
-          self.column_comments ||= {}
-          self.column_comments[name] = options[:comment]
-        end
-        super(name, type, options)
-      end
+    class RawGeomInfo < Struct.new(:type,:srid,:dimension,:with_z,:with_m) #:nodoc:
     end
   end
 end
 
-module OracleSpatialAdapter
-  include SpatialAdapter
-  include ActiveRecord::ConnectionAdapters
 
-  @@do_not_prefetch_primary_key ||= {} # Because OracleEnhancedAdapter requires it. Don't hate.
+module ActiveRecord
+  module ConnectionAdapters
+    class OracleTableDefinition < TableDefinition
+      attr_reader :geom_columns
 
-  # TODO: Add :point, :line_string, :polygon, :geometry_collection, :multi_point, :multi_line_string, and :multi_polygon
-  def geometry_data_types
-    { :geometry => { :name => "SDO_GEOMETRY"} }
-  end
+      def column(name, type, options = {})
+        unless @base.geometry_data_types[type.to_sym].nil?
+          geom_column = OracleColumnDefinition.new(@base, name, type)
+          geom_column.null = options[:null]
+          srid = options[:srid] || -1
+          srid = @base.default_srid if srid == :default_srid
+          geom_column.srid = srid
+          geom_column.with_z = options[:with_z] || false
+          geom_column.with_m = options[:with_m] || false
 
-  def native_database_types_with_spatial
-    native_database_types_without_spatial.merge( geometry_data_types )
-  end
-
-  def columns_without_cache_with_spatial(table_name, name = nil) #:nodoc:
-    ignored_columns = ignored_table_columns(table_name)
-    (owner, desc_table_name, db_link) = @connection.describe(table_name)
-
-    @@do_not_prefetch_primary_key[table_name] =  has_primary_key_trigger?(table_name, owner, desc_table_name, db_link)
-
-    table_cols_sql  = get_table_cols_sql(db_link,owner,desc_table_name)
-    table_cols_meta = select_all(table_cols_sql, name)
-    table_cols_meta = table_cols_meta.delete_if { |row| ignored_columns && ignored_columns.include?(row['name'].downcase) }
-    metadata_to_columns(table_cols_meta, desc_table_name)
-  end
-
-  def add_index_with_spatial(table_name,column_name,options = {})
-    return add_index_without_spatial(table_name, column_name, options) unless options[:spatial]
-    unless spatially_indexed_on?(table_name, column_name)
-      sql = "CREATE INDEX #{index_name(table_name, column_name)} ON #{table_name}(#{Array(column_name).join(", ")}) INDEXTYPE IS MDSYS.SPATIAL_INDEX"
-      begin
-        execute sql
-      rescue Exception => e
-        self.error("Failed to create spatial index: #{e.message}")
-        if indexes(table_name).select { |i| i.spatial }.select { |si| si.columns.include?(column_name) }.empty?
-          self.error("Cleaning up botched spatial index...")
-          execute drop_index_sql(table_name, column_name) rescue nil
-          execute delete_sdo_index_metadata_sql(table_name, column_name) rescue nil
-          self.error("To diagnose the issue, try running the following command in SQLPlus:")
-          self.error(sql)
+          @geom_columns = [] if @geom_columns.nil?
+          @geom_columns << geom_column
+        else
+          super(name,type,options)
         end
       end
-    end
-  end
 
-  def create_table_with_spatial(name, options = {})
-    table_definition = ActiveRecord::ConnectionAdapters::TableDefinition.new(self)
-    table_definition.primary_key(options[:primary_key] || 'id') unless options[:id] == false
+      SpatialAdapter.geometry_data_types.keys.each do |column_type|
+        class_eval <<-EOV
+          def #{column_type}(*args)
+            options = args.extract_options!
+            column_names = args
 
-    yield table_definition if block_given?
-
-    drop_table(name) rescue nil if options[:force]
-    execute create_table_sql(name, table_definition, :temporary =>  options[:temporary], :options => options[:options])
-    create_sequence_and_trigger(name, options) if options[:id] != false || table_definition.create_sequence
-    add_table_comment name, options[:comment]
-    ensure_spatial_column_metadata_exists(name, table_definition)
-    add_column_comments(table_definition)
-  end
-
-  def indexes_with_spatial(table_name, name = nil)
-    result = select_all(index_sql(table_name)).uniq
-    return index_list_to_definitions(result)
-  end
-
-  def spatially_indexed_on?(table_name, columns)
-    spatials = indexes(table_name).select { |i| i.spatial }
-    columns.inject(false) do |is_indexed, column_name|
-      is_indexed || !spatials.select { |si| si.columns.include?(column_name.to_s) }.empty?
-    end
-  end
-
-  def is_spatial_column?(table_name, column_name, sql_type = nil)
-    geometry_data_types.values.map { |t| t[:name] }.include?(sql_type) || column_spatial_info(table_name)[column_name].not_blank?
-  end
-
-  def column_spatial_info(table_name)
-    meta = execute "SELECT * FROM USER_SDO_GEOM_METADATA WHERE table_name = '#{table_name.to_s.upcase}'"
-    raw_geom_infos = {}
-    meta.fetch { |sdo| raw_geom_infos[sdo[1]] = RawGeomInfo.new('SDO_GEOMETRY',sdo[3], sdo[2]) }      # RawGeomInfo arguments: Struct.new(:type,:srid,:dimension,:with_z,:with_m)
-    raw_geom_infos.each_value { |v| v.convert! }
-  end
-
-  def delete_sdo_index_metadata(table_name, column_name)
-    execute delete_sdo_index_metadata_sql(table_name, column_name)
-  end
-
-  def delete_sdo_index_metadata_sql(table_name, column_name)
-    "DELETE FROM user_sdo_index_metadata where SDO_INDEX_NAME='#{index_name(table_name, column_name)}'"
-  end
-
-  def drop_index_sql(table_name, column_name)
-    "DROP INDEX #{index_name(table_name, column_name)}"
-  end
-
-  def metadata_to_columns(table_cols_meta, table_name)
-    table_cols_meta.map do |row|
-      name                                  = oracle_downcase(row['name'])
-      limit, scale, sql_type, data_default  = row['limit'], row['scale'], row['sql_type'], row['data_default']
-      nullable                              = row['nullable'] == 'Y'
-
-      sql_type << "(#{(limit || 38).to_i}" + ((scale = scale.to_i) > 0 ? ",#{scale})" : ")") if limit || scale
-
-      clean_up_odd_default_spacing!(data_default)
-
-      klass = is_spatial_column?(table_name, name, sql_type) ? SpatialOracleEnhancedColumn : OracleEnhancedColumn
-      klass.new(name, data_default, sql_type, nullable, table_name, get_type_for_column(table_name, name))
-    end
-  end
-
-  def clean_up_odd_default_spacing!(string)
-    return unless string
-    string.sub!(/^(.*?)\s*$/, '\1')
-    string.sub!(/^'(.*)'$/, '\1')
-    string.delete!(string) if string =~ /^(null|empty_[bc]lob\(\))$/i
-  end
-
-  def get_table_cols_sql(db_link,owner, table_name)
-   str = <<-SQL
-      select column_name as name, data_type as sql_type, data_default, nullable,
-             decode(data_type, 'NUMBER', data_precision,
-                               'FLOAT', data_precision,
-                               'VARCHAR2', decode(char_used, 'C', char_length, data_length),
-                               'CHAR', decode(char_used, 'C', char_length, data_length),
-                                null) as limit,
-             decode(data_type, 'NUMBER', data_scale, null) as scale
-        from all_tab_columns#{db_link}
-       where owner      = '#{owner}'
-         and table_name = '#{table_name}'
-       order by column_id
-    SQL
-  end
-
-  def add_column_comments(table_definition)
-    column_comments = table_definition.column_comments
-    column_comments ||= {}
-    column_comments.each { |column_name, comment| add_comment name, column_name, comment }
-  end
-
-  def ensure_spatial_column_metadata_exists(table_name, table_definition)
-    existing_metadata = column_spatial_info(table_name)
-    table_definition.spatial_columns.each do |column|
-      execute sdo_metadata_sql(table_name, column.name) unless existing_metadata[column.name.to_s.upcase]
-    end
-  end
-
-  def drop_table_with_spatial(table_name, options = {})
-    column_spatial_info(table_name).keys do |spatial_column|
-      execute delete_sdo_metadata_sql(table_name, spatial_column)
-    end
-    drop_table_without_spatial(table_name, options)
-  end
-
-  # TODO: Support user-defined dimension limits and tolerance in the migrations
-  def sdo_metadata_sql(table_name, column_name, srid = "NULL", *dimensions)
-    sql = <<-SQL
-      INSERT INTO USER_SDO_GEOM_METADATA (TABLE_NAME, COLUMN_NAME, DIMINFO, SRID)
-      VALUES ('#{table_name.to_s.upcase}', '#{column_name.to_s.upcase}',
-          MDSYS.SDO_DIM_ARRAY(
-              MDSYS.SDO_DIM_ELEMENT('X', -179.999783489, 180.000258016, 0.000000050),
-              MDSYS.SDO_DIM_ELEMENT('Y', -89.999828389, 83.633810934, 0.000000050)
-          ),
-          NULL)
-    SQL
-  end
-
-  def delete_sdo_metadata_sql(table_name, column_name)
-    sql = <<-SQL
-      DELETE FROM USER_SDO_GEOM_METADATA WHERE table_name = '#{table_name.to_s.upcase}' AND column_name = '#{column_name.to_s.upcase}'
-    SQL
-  end
-
-  def create_table_sql(name, table_definition, options)
-    sql = <<-SQL
-      CREATE #{'TEMPORARY' if options[:temporary]} TABLE #{name} (
-         #{table_definition.to_sql}
-      ) #{options[:options]}
-    SQL
-  end
-
-  def index_list_to_definitions(result)
-    current_index = nil
-    indexes = []
-    result.each do |row|
-      if current_index != row['index_name']
-        indexes << IndexDefinition.new(row['table_name'], row['index_name'], row_describes_unique_index?(row), [], row_describes_spatial_index?(row))
-        current_index = row['index_name']
+            column_names.each { |name| column(name, '#{column_type}', options) }
+          end
+        EOV
       end
-      indexes.last.columns << (row['column_expression'].nil? ? row['column_name'] : row['column_expression'].gsub('"','').downcase)
     end
-    indexes
-  end
 
-  def row_tablespace_name(index_row)
-    index_row['tablespace_name'] == default_tablespace ? nil : index_row['tablespace_name']
-  end
+    class OracleColumnDefinition < ColumnDefinition
+      attr_accessor :srid, :with_z,:with_m
+      attr_reader :spatial
 
-  def row_describes_unique_index?(index_row)
-    index_row['uniqueness'] == "UNIQUE"
-  end
+      def initialize(base = nil, name = nil, type=nil, limit=nil, default=nil,null=nil,srid=-1,with_z=false,with_m=false)
+        super(base, name, type, limit, default,null)
+        @spatial=true
+        @srid=srid
+        @with_z=with_z
+        @with_m=with_m
+      end
 
-  def row_describes_spatial_index?(index_row)
-    index_row['ityp_name'] == 'SPATIAL_INDEX'
-  end
+      def sql_create_statements(table_name)
+          type_sql = type_to_sql(type)
 
-  def index_sql(table_name)
-    (owner, table_name, db_link) = @connection.describe(table_name)
-    <<-SQL
-        SELECT
-          lower(i.table_name) as table_name,
-          lower(i.index_name) as index_name,
-          i.uniqueness,
-          lower(i.tablespace_name) as tablespace_name,
-          lower(c.column_name) as column_name,
-          e.column_expression as column_expression,
-          lower(i.index_type) as index_type,
-          i.ityp_name as ityp_name
-        FROM user_indexes#{db_link} i
-        JOIN user_ind_columns#{db_link} c on c.index_name = i.index_name
-        LEFT OUTER JOIN user_ind_expressions#{db_link} e on e.index_name = i.index_name and e.column_position = c.column_position
-        LEFT OUTER JOIN user_sdo_geom_metadata sdo on sdo.column_name = C.COLUMN_NAME
-        WHERE lower(i.table_name) = '#{table_name.to_s.downcase}'
-        AND NOT EXISTS (SELECT uc.index_name FROM user_constraints uc WHERE uc.index_name = i.index_name AND uc.constraint_type = 'P')
-        ORDER BY i.index_name, c.column_position
-      SQL
-  end
+          #column_sql = "SELECT AddGeometryColumn('#{table_name}','#{name}',#{srid},'#{type_sql}',#{dimension})"
+          column_sql = "ALTER TABLE #{table_name} ADD (#{name} #{type_sql}"
+          column_sql += " NOT NULL" if null == false
+          column_sql += ")"
+          stmts = [column_sql]
+          if srid == 8307 # There are others we should probably support, but this is common
+            dim_elems = ["MDSYS.SDO_DIM_ELEMENT('X', -180.0, 180.0, 0.005)",
+                         "MDSYS.SDO_DIM_ELEMENT('Y', -90.0, 90.0, 0.005)"]
+          else
+            dim_elems = ["MDSYS.SDO_DIM_ELEMENT('X', -1000, 1000, 0.005)",
+                         "MDSYS.SDO_DIM_ELEMENT('Y', -1000, 1000, 0.005)"]
+          end
+          if @with_z
+            dim_elems << "MDSYS.SDO_DIM_ELEMENT('Z', -1000, 1000, 0.005)"
+          end
+          if @with_m
+            dim_elems << "MDSYS.SDO_DIM_ELEMENT('M', -1000, 1000, 0.005)"
+          end
 
-  def error(message)
-    RAILS_DEFAULT_LOGGER.error(message)
-    puts "ERROR! #{message}"
+          stmts <<  "DELETE FROM USER_SDO_GEOM_METADATA WHERE TABLE_NAME = '#{table_name.to_s.upcase}' AND COLUMN_NAME = '#{name.to_s.upcase}'"
+          stmts << "INSERT INTO USER_SDO_GEOM_METADATA (TABLE_NAME, COLUMN_NAME, DIMINFO, SRID) VALUES (" +
+                   "'#{table_name}', '#{name}', MDSYS.SDO_DIM_ARRAY(#{dim_elems.join(',')}),#{srid})"
+          stmts
+      end
+
+      def to_sql(table_name)
+        if @spatial
+          raise "Got here!"
+        else
+          super
+        end
+      end
+
+
+      private
+      def type_to_sql(name, limit=nil)
+        case name.to_s
+        when /geometry|point|line_string|polygon|multipoint|multilinestring|multipolygon|geometrycollection/i
+          "MDSYS.SDO_GEOMETRY"
+        else base.type_to_sql(name, limit) rescue name
+        end
+      end
+
+    end
+
+  end
+end
+
+#Would prefer creation of a OracleColumn type instead but I would need to reimplement methods where Column objects are instantiated so I leave it like this
+module ActiveRecord
+  module ConnectionAdapters
+    class SpatialOracleColumn < Column
+
+      include SpatialColumn
+
+      # With the ruby-oci8 adapter, we get objects back from spatial columns
+      # so this method name is a bit of a misnomer. TODO: change this method name to 'to_geometry'
+      def self.string_to_geometry(obj)
+        return obj unless obj && obj.class.to_s == "OCI8::Object::Mdsys::SdoGeometry"
+        raise "Bad #{obj.class} object: #{obj.inspect}" if obj.sdo_gtype.nil?
+        ndim = obj.sdo_gtype.to_int/1000
+        gtype = obj.sdo_gtype.to_int%1000
+        eleminfo = obj.sdo_elem_info.instance_variable_get('@attributes')
+        ordinates = obj.sdo_ordinates.instance_variable_get('@attributes')
+        case gtype
+        when 1
+          geom = point_from_sdo_geometry(eleminfo, ordinates, ndim, obj.sdo_point)
+        when 2
+          geom = linestrings_from_sdo_geometry(eleminfo, ordinates, ndim)[0]
+        when 3
+          geom = polygons_from_sdo_geometry(eleminfo, ordinates, ndim)[0]
+        when 4
+          geom = geomcollection_from_sdo_geometry(eleminfo, ordinates, ndim)
+        when 5
+          geom = MultiPoint.from_coordinates(group_ordinates(ordinates, ndim))
+        when 6
+          linestrings = linestrings_from_sdo_geometry(eleminfo, ordinates, ndim)
+          geom = MultiLineString.from_line_strings(linestrings)
+        when 7
+          polygons = polygons_from_sdo_geometry(eleminfo, ordinates, ndim)
+          geom = MultiPolygon.from_polygons(polygons)
+        else
+          raise "Unhandled geometry type #{obj.sdo_gtype.to_int}"
+        end
+        geom.srid = obj.sdo_srid.to_i
+        geom
+      end
+
+      def self.group_ordinates(ordinates, num_dims)
+        coords = []
+        ordinates.each_slice(num_dims) do |coord|
+          x,y = coord
+          coords << [x.to_f, y.to_f]
+        end
+        coords
+      end
+
+      def self.point_from_sdo_point(sdo_point, ndim)
+        if ndim == 2
+          Point.from_x_y(sdo_point.x.to_f, sdo_point.y.to_f)
+        elsif ndim == 3
+          Point.from_x_y_z(sdo_point.x.to_f, sdo_point.y.to_f, sdo_point.z.to_f)
+        else
+          raise "Not supporting #{ndim} dimensional points"
+        end
+      end
+
+      def self.point_from_sdo_geometry(elem_info, ordinates, ndim, sdo_point)
+        if sdo_point
+          point_from_sdo_point(sdo_point, ndim)
+        else
+          coords = ordinates.slice(0,ndim)
+          if ndim == 2
+            Point.from_x_y(ordinates[0].to_f, ordinates[1].to_f)
+          elsif ndim == 3
+            Point.from_x_y_z(ordinates[0].to_f, ordinates[1].to_f, ordinates[2].to_f)
+          end
+        end
+      end
+
+      def self.linestrings_from_sdo_geometry(elem_info, ordinates, ndim)
+        num_ls = elem_info.size / 3
+        linestrings = []
+        0.upto(num_ls-1) do |ring_idx|
+          (start_ord, ring_type, gtype, end_ord) = elem_info.slice(ring_idx*3,4)
+          end_ord ||= ordinates.size + 1
+          num_ords = end_ord - start_ord
+          linestrings << LineString.from_coordinates(group_ordinates(ordinates.slice(start_ord-1, num_ords), ndim))
+        end
+        linestrings
+      end
+
+      def self.polygons_from_sdo_geometry(elem_info, ordinates, ndim)
+        num_rings = elem_info.size / 3
+        polygons = []
+        rings = []
+        cur_polygon = nil
+        0.upto(num_rings-1) do |ring_idx|
+          (start_ord, etype, interpretation, end_ord) = elem_info.slice(ring_idx*3,4)
+          end_ord ||= ordinates.size + 1
+          num_ords = end_ord - start_ord
+          if etype == 1003 && rings.size > 0 # exterior ring
+            polygons << Polygon.from_linear_rings(rings)
+            rings = []
+          end
+          rings << LinearRing.from_coordinates(group_ordinates(ordinates.slice(start_ord-1, num_ords), ndim))
+        end
+        if rings.size > 0 # exterior ring
+          polygons << Polygon.from_linear_rings(rings)
+          rings = []
+        end
+        polygons
+      end
+
+      def self.geomcollection_from_sdo_geometry(elem_info, ordinates, ndim)
+        num_elems = elem_info.size / 3
+        geometries = []
+        0.upto(num_elems-1) do |idx|
+          (start_ord, etype, interpretation, end_ord) = elem_info.slice(idx*3,4)
+          end_ord ||= ordinates.size + 1
+          num_ords = end_ord - start_ord
+          geom = nil
+          case etype
+          when 1
+            if ndim == 2
+              geom = Point.from_x_y(ordinates[start_ord-1].to_f, ordinates[start_ord].to_f)
+            elsif ndim == 3
+              geom = Point.from_x_y_z(ordinates[start_ord-1].to_f, ordinates[start_ord].to_f, ordinates[start_ord+1].to_f)
+            else
+              raise "Not supporting #{ndim} dimensional points"
+            end
+          when 2
+            geom = LineString.from_coordinates(group_ordinates(ordinates.slice(start_ord-1, num_ords), ndim))
+          when 1003
+            raise "Unsupported interpretation #{interpretation} for etype 1003" if interpretation != 1
+            ring = LinearRing.from_coordinates(group_ordinates(ordinates.slice(start_ord-1, num_ords), ndim))
+            geom = Polygon.from_linear_rings([ring])
+          when 2003
+            raise "Unsupported interpretation #{interpretation} for etype 2003" if interpretation != 1
+            ring = LinearRing.from_coordinates(group_ordinates(ordinates.slice(start_ord-1, num_ords), ndim))
+            last_geom = geometries.pop
+            geom = Polygon.from_linear_rings(last_geom.rings + [ring])
+          else
+            raise "Unsupported type in collection: etype = #{etype}, interpretation = #{interpretation}"
+          end
+          geometries << geom if geom
+        end
+        GeometryCollection.from_geometries(geometries)
+      end
+    end
   end
 end
 
 ActiveRecord::SchemaDumper.class_eval do
+  def oracle_enhanced_table(table, stream)
+    columns = @connection.columns(table)
+    begin
+      tbl = StringIO.new
 
-  def indexes(table, stream)
-    indexes = @connection.indexes(table)
-    indexes.each do |index|
-      stream.print "  add_index #{index.table.inspect}, #{index.columns.inspect}, :name => #{index.name.inspect}"
-      stream.print ", :unique => true" if index.unique
-      stream.print ", :spatial => true " if index.spatial
+      # first dump primary key column
+      if @connection.respond_to?(:pk_and_sequence_for)
+        pk, pk_seq = @connection.pk_and_sequence_for(table)
+      elsif @connection.respond_to?(:primary_key)
+        pk = @connection.primary_key(table)
+      end
+
+      tbl.print "  create_table #{table.inspect}"
+
+      # addition to make temporary option work
+      tbl.print ", :temporary => true" if @connection.temporary_table?(table)
+
+      if columns.detect { |c| c.name == pk }
+        if pk != 'id'
+          tbl.print %Q(, :primary_key => "#{pk}")
+        end
+      else
+        tbl.print ", :id => false"
+      end
+      tbl.print ", :force => true"
+      tbl.puts " do |t|"
+
+      # then dump all non-primary key columns
+      column_specs = columns.map do |column|
+        raise StandardError, "Unknown type '#{column.sql_type}' for column '#{column.name}'" if @types[column.type].nil?
+        next if column.name == pk
+        spec = column_spec(column)
+        (spec.keys - [:name, :type]).each{ |k| spec[k].insert(0, "#{k.inspect} => ")}
+        spec
+      end.compact
+
+      # find all migration keys used in this table
+      keys = [:name, :limit, :precision, :scale, :default, :null, :with_z, :with_m, :srid] & column_specs.map(&:keys).flatten
+
+      # figure out the lengths for each column based on above keys
+      lengths = keys.map{ |key| column_specs.map{ |spec| spec[key] ? spec[key].length + 2 : 0 }.max }
+
+      # the string we're going to sprintf our values against, with standardized column widths
+      format_string = lengths.map{ |len| "%-#{len}s" }
+
+      # find the max length for the 'type' column, which is special
+      type_length = column_specs.map{ |column| column[:type].length }.max
+
+      # add column type definition to our format string
+      format_string.unshift "    t.%-#{type_length}s "
+
+      format_string *= ''
+
+      column_specs.each do |colspec|
+        values = keys.zip(lengths).map{ |key, len| colspec.key?(key) ? colspec[key] + ", " : " " * len }
+        values.unshift colspec[:type]
+        tbl.print((format_string % values).gsub(/,\s*$/, ''))
+        tbl.puts
+      end
+
+      tbl.puts "  end"
+      tbl.puts
+
+      indexes(table, tbl)
+
+      tbl.rewind
+      stream.print tbl.read
+    rescue => e
+      stream.puts "# Could not dump table #{table.inspect} because of following #{e.class}"
+      stream.puts "#   #{e.message} #{e.backtrace.join("\n")}"
       stream.puts
     end
 
-    stream.puts unless indexes.empty?
+    stream
   end
-end
 
-module ActiveRecord
-  module ConnectionAdapters
+  private
 
-    OracleEnhancedAdapter.class_eval do
-      include OracleSpatialAdapter
-      alias_method_chain :native_database_types, :spatial
-      alias_method_chain :columns_without_cache, :spatial
-      alias_method_chain :indexes, :spatial
-      alias_method_chain :create_table, :spatial
-      alias_method_chain :add_index, :spatial
+  def indexes_with_oracle_enhanced_spatial(table, stream)
+    if (indexes = @connection.indexes(table)).any?
+      add_index_statements = indexes.map do |index|
+        case index.type
+        when nil
+          # use table.inspect as it will remove prefix and suffix
+          statement_parts = [ ('add_index ' + table.inspect) ]
+          statement_parts << index.columns.inspect
+          statement_parts << (':name => ' + index.name.inspect)
+          statement_parts << ':unique => true' if index.unique
+          statement_parts << ':tablespace => ' + index.tablespace.inspect if index.tablespace
+        when 'MDSYS.SPATIAL_INDEX'
+          statement_parts = [ ('add_index ' + table.inspect) ]
+          statement_parts << index.columns.inspect
+          statement_parts << (':name => ' + index.name.inspect)
+          statement_parts << ':unique => true' if index.unique
+          statement_parts << ':spatial => true' if index.spatial
+          statement_parts << ':tablespace => ' + index.tablespace.inspect if index.tablespace
+        when 'CTXSYS.CONTEXT'
+          if index.statement_parameters
+            statement_parts = [ ('add_context_index ' + table.inspect) ]
+            statement_parts << index.statement_parameters
+          else
+            statement_parts = [ ('add_context_index ' + table.inspect) ]
+            statement_parts << index.columns.inspect
+            statement_parts << (':name => ' + index.name.inspect)
+          end
+        else
+          # unrecognized index type
+          statement_parts = ["# unrecognized index #{index.name.inspect} with type #{index.type.inspect}"]
+        end
+        '  ' + statement_parts.join(', ')
+      end
+
+      stream.puts add_index_statements.sort.join("\n")
+      stream.puts
     end
-
-    TableDefinition.class_eval { include SpatialTableDefinition }
-
   end
+  alias_method_chain :indexes, :oracle_enhanced_spatial
+
 end
