@@ -85,7 +85,7 @@ ActiveRecord::ConnectionAdapters::OracleEnhancedAdapter.class_eval do
     create_sql << table_definition.to_sql
     create_sql << ") #{options[:options]}"
     execute create_sql
-    execute "CREATE SEQUENCE #{name}_seq START WITH 10000" unless options[:id] == false
+    execute "CREATE SEQUENCE #{name}_seq START WITH #{default_sequence_start_value}" unless options[:id] == false
 
     #added to create the geometric columns identified during the table definition
     unless table_definition.geom_columns.nil?
